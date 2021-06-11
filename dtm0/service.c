@@ -676,6 +676,312 @@ static void dtm0_service__ha_unsubscribe(struct m0_reqh_service *reqh_service)
 	M0_LEAVE();
 }
 
+/* DTM0 RPC Link is a lazy ("on-demand") RPC link. */
+#define M0_DTM0_RPC_LINK_OPCODE ({ M0_ASSERT_INFO(0, "TBD"); 0 })
+
+struct drlink_fom {
+	struct m0_fom        df_gen;
+	struct dtm0_req_fop *df_fop;
+	struct m0_co_context df_co;
+	struct m0_dtm0_service df_svc;
+	struct m0_fid        df_tgt;
+};
+
+static struct drlink_fom *fom2drlink_fom(struct m0_fom *fom)
+{
+	struct drlink_fom *df;
+	df = M0_AMB(df, fom, df_gen);
+	return df;
+}
+
+static size_t drlink_fom_locality(const struct m0_fom *fom)
+{
+	static size_t loc;
+	return loc++;
+}
+
+static void drlink_fom_fini(struct m0_fom *fom)
+{
+	/* TODO: release dfop */
+}
+
+static int  drlink_fom_tick(struct m0_fom *fom);
+
+static const struct m0_fom_ops drlink_fom_ops = {
+	.fo_fini          = drlink_fom_fini,
+	.fo_tick          = drlink_fom_tick,
+	.fo_home_locality = drlink_fom_locality
+};
+
+static struct m0_fom_type drlink_fom_type;
+
+static const struct m0_fom_type_ops tx_group_fom_type_ops = {
+	.fto_create = NULL
+};
+
+
+static void m0_dtm0_rpc_link_mod_init(void)
+{
+	m0_fom_type_init(&drlink_fom_type,
+			 M0_DTM0_RPC_LINK_OPCODE,
+			 &drlink_fom_type_ops,
+			 &dtm0_service_type,
+			 &drlink_fom_conf);
+}
+
+static void m0_dtm0_rpc_link_mod_fini(void)
+{
+}
+
+static int drlink_fom_alloc(struct drlink_fom **out)
+{
+	struct drlink_fom *fom;
+	M0_ALLOC_PTR(fom);
+	if (fom == NULL)
+		return M0_ERR(-ENOMEM);
+	*out = fom;
+	return 0;
+}
+
+static void drlink_fom_free(struct drlink_fom *fom)
+{
+	m0_free(fom);
+}
+
+
+static void drlink_fom_init(struct drlink_fom      *fom,
+			    struct m0_dtm0_service *svc,
+			    const struct m0_fid    *tgt,
+			    struct dtm0_req_fop    *dfop)
+{
+	M0_ENTRY();
+
+	M0_PRE(fom != NULL);
+	M0_PRE(proc != NULL);
+	M0_PRE(dfop != NULL);
+	M0_PRE(m0_fid_is_valid(tgt));
+
+	m0_fom_init(&fom->df_gen, &rlink_fom_type,
+		    &drlink_fom_ops, NULL, NULL,
+		    proc->dop_dtm0_service->rs_reqh);
+
+	fom->df_fop =  dfop;
+	fom->df_svc =  svc;
+	fom->df_tgt = *tgt;
+
+	M0_ASSERT_INFO(0, "TODO: initialise the coro!");
+
+	M0_LEAVE();
+}
+
+
+static void co_long_write_lock(struct m0_co_context *context,
+			       struct m0_long_lock *lk,
+			       struct m0_long_lock_link *link,
+			       int next_phase)
+{
+	M0_CO_REENTER(context);
+	if (!m0_long_write_lock(lk, link, next_phase))
+		M0_CO_YIELD(context, -EWOULDBLOCK);
+}
+
+static void co_rpc_link_connect(struct m0_fom *fom,
+				struct m0_rpc_link *rlink,
+				int next_phase)
+{
+	M0_CO_REENTER(context);
+
+	m0_chan_lock(&rlink->rlk_wait);
+	m0_fom_wait_on(fom, &rlink->rlk_wait);
+	m0_chan_unlock(&rlink->rlk_wait);
+
+	m0_rpc_link_connect_async(&rlink, NULL);
+	m0_fom_phase_set(next_phase);
+	M0_CO_YIELD(context, -EWOULDBLOCK);
+}
+
+static struct m0_dtm0_service *find_or_add(struct m0_dtm0_service *dtms,
+					   struct ep,
+					   struct fid)
+{
+	process = dtm0_service_process__lookup(dtms, tgt);
+
+	if (process == NULL)
+		process = dtm0_process_alloc();
+
+	if (process != NULL)
+		dtm0_process_init(process, dtms, ep, fid);
+
+	return process;
+}
+
+
+enum states {
+	INITIALISED,
+	LOCKING,
+	LOCKED,
+	TRYING_TO_CONNECT,
+	CONNECTING,
+	ACTIVE,
+	DONE,
+};
+
+const struct m0_rpc_item_ops dtm0_req_fop_rlink_rpc_item_ops = {
+        .rio_replied = dtm0_rlink_rpc_item_reply_cb,
+};
+
+static void dtm0_rlink_rpc_item_reply_cb(struct m0_rpc_item *item)
+{
+	struct m0_fop *reply = NULL;
+	struct drlink_fom *df = item2drlink_fom(item);
+
+	M0_ENTRY("item=%p", item);
+
+	M0_PRE(item != NULL);
+	M0_PRE(M0_IN(m0_fop_opcode(m0_rpc_item_to_fop(item)),
+		     (M0_DTM0_REQ_OPCODE)));
+
+	if (m0_rpc_item_error(item) == 0) {
+		reply = m0_rpc_item_to_fop(item->ri_reply);
+		M0_ASSERT(M0_IN(m0_fop_opcode(reply), (M0_DTM0_REP_OPCODE)));
+	}
+
+	m0_fom_wakeup(&df->df_gen);
+
+	M0_LEAVE("reply=%p", reply);
+}
+
+static void dtm0_process_rlink_reinit(struct dtm0_process *proc);
+static int  dtm0_process_rlink_send(struct dtm0_process *proc,
+				    struct dtm0_req_fop *req)
+{
+	/* TODO: fill in the item */
+	return m0_rpc_post(item);
+}
+
+static bool dtm0_process_ha_is_alive(struct dtm0_process *proc);
+
+#define F M0_CO_FRAME_DATA
+static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
+{
+	M0_CO_REENTER(context,
+		      struct m0_long_lock_link   llink;
+		      struct m0_long_lock_addb2  llock_addb2;
+		      struct dtm0_process       *proc;
+		      struct drlink_fom         *drf;
+		      int                        rc;
+		      bool                       delivered;
+		      );
+
+	F(rc) = 0;
+	F(delivered) = false;
+	F(drf) = M0_AMB(context, context, df_co);
+
+
+	m0_mutex_lock(&F(drf)->df_svc->dos_generic.rs_mutex);
+	F(proc) = find_or_add(F(drf)->df_svc, ep, fid);
+	m0_mutex_unlock(&F(drf)->df_svc->dos_generic.rs_mutex);
+
+	if (F(proc) == NULL) {
+		F(rc) = M0_ERR(-ENOMEM);
+		goto out;
+	}
+
+	m0_long_lock_link_init(&F(llink), &F(drf)->df_gen, &F(llock_addb2));
+	m0_fom_phase_set(F(drf)->df_gen, INITIALISED);
+
+	M0_CO_FUN(context, co_long_write_lock(context,
+					      F(proc)->llock,
+					      &F(llink),
+					      LOCKING));
+
+	while (!F(delivered)) {
+		while (!m0_rpc_link_is_connected(&F(proc)->rlink)) {
+			m0_fom_phase_set(F(drf)->df_gen, TRYING_TO_CONNECT);
+			dtm0_process_rlink_reinit(F(proc));
+			M0_CO_FUN(context,
+				  co_rpc_link_connect(proc->rlink,
+						      rlink, CONNECTING));
+			if (!dtm0_process_ha_is_alive(&F(proc)))
+				goto unlock
+		}
+
+		m0_fom_phase_set(F(drf)->df_gen, ACTIVE);
+		F(rc) = dtm0_process_rlink_send(F(proc), F(drf)->df_fop,
+						&F(item));
+		if (F(rc) != 0)
+			goto unlock;
+
+		M0_CO_YIELD(context, -EWOULDBLOCK);
+
+		F(delivered) = m0_rpc_item_error(F(item)) == 0;
+		/* TODO: Add more showstoppers here (ENOBUFS or something). */
+		if (M0_IN(m0_rpc_item_error(F(item)), (-ENOMEM))) {
+			F(rc) = m0_rpc_item_error(F(item);
+			goto unlock;
+		}
+	}
+
+	m0_fom_phase_set(&F(drf)->df_gen, DONE);
+
+unlock:
+	m0_long_write_unlock(&F(proc)->llock, &F(llink));
+	m0_long_link_fini(&F(llink));
+out:
+	*prc = F(rc);
+	return;
+}
+
+static int co_ret2fom_ret(int rc)
+{
+	switch (rc) {
+	case 0:
+		return 0;
+	case -EAGAIN:
+		return M0_FSO_AGAIN;
+	case -EWOULDBLOCK:
+		return M0_FSO_WAIT;
+	default:
+		M0_IMPOSSIBLE();
+	}
+}
+
+static int drlink_fom_tick(struct m0_fom *fom)
+{
+	struct m0_co_context *co = NULL;
+	int                   phase_rc;
+	int                   outcome;
+
+	M0_PRE(co != NULL);
+
+	M0_CO_START(&co);
+	drlink_coro_fom_tick(co, &phase_rc);
+	outcome = co_ret2fom_ret(M0_CO_END(co));
+
+	if (outcome == 0 && phase_rc != 0)
+		m0_fom_phase_move(&fom->cf_fom, phase_rc, M0_FOPH_FAILURE);
+
+	return outcome;
+}
+
+M0_INTERNAL int m0_dtm0_post_msg(struct m0_dtm0_service *svc,
+				 struct dtm0_req_fop    *req,
+				 const struct m0_fid    *tgt)
+{
+	int                rc;
+	struct drlink_fom *fom = NULL;
+
+	M0_ENTRY();
+
+	rc = drlink_fom_alloc(&fom);
+	if (rc == 0) {
+		drlink_fom_init(fom, svc, tgt, req);
+		m0_fom_queue(&fom->df_gen);
+	}
+
+	return M0_RC(rc);
+}
+
 
 /*
  *  Local variables:

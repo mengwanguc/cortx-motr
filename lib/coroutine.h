@@ -140,8 +140,8 @@ struct m0_co_context {
 	void                         *mc_locals[M0_MCC_STACK_NR];
 	/** current frame pointer */
 	uint64_t                      mc_frame;
-	/** true if stack is unwinding */
-	bool                          mc_yield;
+	/** Not zero if stack is unwinding */
+	int                           mc_yield;
 	/** current frame pointer during reentering */
 	uint64_t                      mc_yield_frame;
 	/** simple pool allocator for locals */
@@ -160,11 +160,12 @@ struct m0_co_context {
 /**
  * @param context -- @see m0_co_context
  * @return -EAGAIN if coroutine is in progress.
+ * @return -EWOULDBLOCK if coroutine is blocked on an external event.
  * @return       0 if coroutine is succeeded.
  */
 #define M0_CO_END(context)                                                \
 ({                                                                        \
-	int rc = ((context)->mc_yield ? -EAGAIN : 0);                     \
+	int rc = (context)->mc_yield;                                     \
 	if (rc == 0) {                                                    \
 		M0_ASSERT((context)->mc_frame == 0);                      \
 		M0_ASSERT((context)->mc_yield_frame == 0);                \
@@ -182,11 +183,11 @@ struct m0_co_context {
 ({                                                                        \
 	__label__ save;                                                   \
 	M0_LOG(M0_CALL, "M0_CO_FUN: context=%p yeild=%d",                 \
-	       context, !!context->mc_yield);                             \
+	       context, context->mc_yield);                               \
 	M0_ASSERT(context->mc_frame < M0_MCC_STACK_NR);                   \
 	context->mc_stack[context->mc_frame++] = &&save;                  \
 save:   (function);                                                       \
-	if (context->mc_yield) {                                          \
+	if (context->mc_yield != 0) {                                     \
 		return;                                                   \
 	} else {                                                          \
 		m0_co_context_locals_free(context);                       \
@@ -221,9 +222,9 @@ save:   (function);                                                       \
 #define M0_CO__REENTER(context, frame_data)                               \
 ({                                                                        \
 	uint64_t size = sizeof(*frame_data);                              \
-	M0_LOG(M0_CALL, "M0_CO_REENTER: context=%p yeild=%d",             \
-	       context, !!context->mc_yield);                             \
-	if (!context->mc_yield) {                                         \
+	M0_LOG(M0_CALL, "M0_CO_REENTER: context=%p yield=%d",             \
+	       context, context->mc_yield);                               \
+	if (context->mc_yield == 0) {                                     \
 		m0_co_context_locals_alloc(context, (size));              \
 		frame_data = m0_co_context_locals(context);               \
 	} else {                                                          \
@@ -242,20 +243,24 @@ save:   (function);                                                       \
  * right after M0_CO_YIELD().
  *
  * @param _context -- @see m0_co_context
+ * @param how  -- -EAGAIN or -EWOULDBLOCK. If a transparent state transition
+ *                is required then -EAGAIN. If the coroutine should block
+ *                on an external event then -EWOULDBLOCK.
  */
-#define M0_CO_YIELD(context)                                              \
+#define M0_CO_YIELD(context, how)                                         \
 ({                                                                        \
 	__label__ save;                                                   \
 	M0_LOG(M0_CALL, "M0_CO_YIELD: context=%p yeild=%d",               \
-	       context, !!context->mc_yield);                             \
-	context->mc_yield = true;                                         \
+	       context, context->mc_yield);                               \
+	M0_ASSERT(M0_IN(how, (-EAGAIN, -EWOULDBLOCK)));                   \
+	context->mc_yield = how;                                          \
 	M0_ASSERT(context->mc_frame < M0_MCC_STACK_NR);                   \
 	context->mc_stack[context->mc_frame++] = &&save;                  \
 	return;                                                           \
 save:                                                                     \
-	M0_ASSERT(context->mc_yield);                                     \
+	M0_ASSERT(!!context->mc_yield);                                   \
 	M0_ASSERT(context->mc_frame == context->mc_yield_frame);          \
-	context->mc_yield = false;                                        \
+	context->mc_yield = 0;                                            \
 	context->mc_yield_frame = 0;                                      \
 	context->mc_frame--;                                              \
 })
