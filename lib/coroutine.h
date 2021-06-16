@@ -140,7 +140,7 @@ struct m0_co_context {
 	void                         *mc_locals[M0_MCC_STACK_NR];
 	/** current frame pointer */
 	uint64_t                      mc_frame;
-	/** Not zero if stack is unwinding */
+	/** non-zero value if stack is unwinding */
 	int                           mc_yield;
 	/** current frame pointer during reentering */
 	uint64_t                      mc_yield_frame;
@@ -160,7 +160,7 @@ struct m0_co_context {
 /**
  * @param context -- @see m0_co_context
  * @return -EAGAIN if coroutine is in progress.
- * @return -EWOULDBLOCK if coroutine is blocked on an external event.
+ * @return -EINTR if coroutine is blocked on an external event.
  * @return       0 if coroutine is succeeded.
  */
 #define M0_CO_END(context)                                                \
@@ -243,16 +243,16 @@ save:   (function);                                                       \
  * right after M0_CO_YIELD().
  *
  * @param _context -- @see m0_co_context
- * @param how  -- -EAGAIN or -EWOULDBLOCK. If a transparent state transition
+ * @param how  -- -EAGAIN or -EINTR. If a transparent state transition
  *                is required then -EAGAIN. If the coroutine should block
- *                on an external event then -EWOULDBLOCK.
+ *                on an external event then -EINTR.
  */
 #define M0_CO_YIELD(context, how)                                         \
 ({                                                                        \
 	__label__ save;                                                   \
 	M0_LOG(M0_CALL, "M0_CO_YIELD: context=%p yeild=%d",               \
 	       context, context->mc_yield);                               \
-	M0_ASSERT(M0_IN(how, (-EAGAIN, -EWOULDBLOCK)));                   \
+	M0_ASSERT(M0_IN(how, (-EAGAIN, -EINTR)));                   \
 	context->mc_yield = how;                                          \
 	M0_ASSERT(context->mc_frame < M0_MCC_STACK_NR);                   \
 	context->mc_stack[context->mc_frame++] = &&save;                  \

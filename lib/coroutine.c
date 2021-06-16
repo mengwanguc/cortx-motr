@@ -126,13 +126,13 @@ M0_INTERNAL void m0_co_context_locals_free(struct m0_co_context *context)
 
 M0_INTERNAL void *m0_co_context_locals(struct m0_co_context *context)
 {
-	return context->mc_locals[context->mc_yield ? context->mc_yield_frame :
+	return context->mc_locals[!!context->mc_yield ? context->mc_yield_frame :
 				  context->mc_frame];
 }
 
 M0_INTERNAL int m0_co_context_init(struct m0_co_context *context)
 {
-	*context = (struct m0_co_context) { .mc_yield = false };
+	*context = (struct m0_co_context) { .mc_yield = 0 };
 	return locals_alloc_init(&context->mc_alloc);
 }
 
