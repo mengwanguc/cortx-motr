@@ -81,7 +81,8 @@ M0_INTERNAL bool m0_dtm0_in_ut(void);
 
 M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 				 const struct dtm0_req_fop *req,
-				 const struct m0_fid       *tgt);
+				 const struct m0_fid       *tgt,
+				 bool                       sync);
 
 #endif /* __MOTR_DTM0_SERVICE_H__ */
 

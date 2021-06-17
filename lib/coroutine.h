@@ -131,7 +131,7 @@ struct m0_co_locals_allocator {
  * @endcode
  *
  * User controls execution of coroutine by checking `M0_CO_END(&context)'-value.
- * Coroutine is in progress if -EAGAIN is returned, if 0 -- it is succeeded.
+ * Coroutine is in progress if non-zero is returned, if 0 -- it is succeeded.
  */
 struct m0_co_context {
 	/** frame address stack */
@@ -159,9 +159,8 @@ struct m0_co_context {
 
 /**
  * @param context -- @see m0_co_context
- * @return -EAGAIN if coroutine is in progress.
- * @return -EINTR if coroutine is blocked on an external event.
- * @return       0 if coroutine is succeeded.
+ * @return any non-zero value if coroutine is in progress.
+ * @return                  0 if coroutine is succeeded.
  */
 #define M0_CO_END(context)                                                \
 ({                                                                        \
@@ -243,16 +242,14 @@ save:   (function);                                                       \
  * right after M0_CO_YIELD().
  *
  * @param _context -- @see m0_co_context
- * @param how  -- -EAGAIN or -EINTR. If a transparent state transition
- *                is required then -EAGAIN. If the coroutine should block
- *                on an external event then -EINTR.
+ * @param how  -- Any non-zero value.
  */
-#define M0_CO_YIELD(context, how)                                         \
+#define M0_CO_YIELD_WITH(context, how)                                    \
 ({                                                                        \
 	__label__ save;                                                   \
 	M0_LOG(M0_CALL, "M0_CO_YIELD: context=%p yeild=%d",               \
 	       context, context->mc_yield);                               \
-	M0_ASSERT(M0_IN(how, (-EAGAIN, -EINTR)));                   \
+	M0_ASSERT(how != 0);                                              \
 	context->mc_yield = how;                                          \
 	M0_ASSERT(context->mc_frame < M0_MCC_STACK_NR);                   \
 	context->mc_stack[context->mc_frame++] = &&save;                  \

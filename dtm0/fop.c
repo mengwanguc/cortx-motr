@@ -249,6 +249,20 @@ static int m0_dtm0_send_msg(struct m0_fom                *fom,
 			    const struct m0_fid          *tgt,
 			    const struct m0_dtm0_tx_desc *txd)
 {
+	struct m0_dtm0_service *dtms;
+	struct dtm0_req_fop req = {
+		.dtr_msg = msg_type,
+		.dtr_txr = *txd,
+	};
+	dtms = m0_dtm0_service_find(fom->fo_service->rs_reqh);
+	return m0_dtm0_req_post(dtms, &req, tgt, false);
+}
+
+int m0_dtm0_send_msg0(struct m0_fom                *fom,
+			    enum m0_dtm0s_msg             msg_type,
+			    const struct m0_fid          *tgt,
+			    const struct m0_dtm0_tx_desc *txd)
+{
 	struct m0_fop          *fop;
 	struct m0_rpc_session  *session;
 	struct m0_rpc_item     *item;

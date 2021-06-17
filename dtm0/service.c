@@ -44,9 +44,7 @@
 #include "conf/helpers.h" /* m0_confc_root_open, m0_conf_process2service_get */
 #include "reqh/reqh.h"    /* m0_reqh2confc */
 
-static int dtm0_service__ha_subscribe(struct m0_reqh_service *service);
-static void dtm0_service__ha_unsubscribe(struct m0_reqh_service *service);
-
+static void dtm0_service_conns_term(struct m0_dtm0_service *service);
 static struct m0_dtm0_service *to_dtm(struct m0_reqh_service *service);
 static int dtm0_service_start(struct m0_reqh_service *service);
 static void dtm0_service_stop(struct m0_reqh_service *service);
@@ -385,13 +383,16 @@ out:
 static int dtm0_service_start(struct m0_reqh_service *service)
 {
         M0_PRE(service != NULL);
-        return dtm_service__origin_fill(service) ?:
-		dtm0_service__ha_subscribe(service);
+        return dtm_service__origin_fill(service);
 }
 
-static void dtm0_service_prepare_to_stop(struct m0_reqh_service *service)
+static void dtm0_service_prepare_to_stop(struct m0_reqh_service *reqh_rs)
 {
-	dtm0_service__ha_unsubscribe(service);
+	struct m0_dtm0_service *dtms;
+
+	M0_PRE(reqh_rs != NULL);
+	dtms = M0_AMB(dtms, reqh_rs, dos_generic);
+	dtm0_service_conns_term(dtms);
 }
 
 static void dtm0_service_stop(struct m0_reqh_service *service)
@@ -466,225 +467,6 @@ M0_INTERNAL bool m0_dtm0_in_ut(void)
 	return M0_FI_ENABLED("ut");
 }
 
-/* --------------------------------- EVENTS --------------------------------- */
-
-static int ready_to_process_ha_msgs = 0;
-
-static bool service_connect_clink(struct m0_clink *link)
-{
-	M0_ENTRY();
-	M0_LOG(M0_DEBUG, "DTM0 service: connected");
-	M0_LEAVE();
-	return true;
-}
-
-static void service_connect_ast(struct m0_sm_group *grp,
-				struct m0_sm_ast   *ast)
-{
-	struct dtm0_process *process = ast->sa_datum;
-	int rc;
-
-	M0_ENTRY();
-	m0_clink_init(&process->dop_service_connect_clink, service_connect_clink);
-	process->dop_service_connect_clink.cl_is_oneshot = true;
-	rc = m0_dtm0_service_process_connect(process->dop_dtm0_service,
-					     &process->dop_rserv_fid,
-					     process->dop_rep,
-					     true);
-	M0_ASSERT(rc == 0);
-	M0_LEAVE();
-}
-
-static bool process_clink_cb(struct m0_clink *clink)
-{
-	struct dtm0_process    *process    = M0_AMB(process, clink,
-						    dop_ha_link);
-	struct m0_conf_obj     *process_obj = container_of(clink->cl_chan,
-						       struct m0_conf_obj,
-						       co_ha_chan);
-	struct m0_reqh_service *dtm0 = process->dop_dtm0_service;
-	struct m0_reqh         *reqh = dtm0->rs_reqh;
-	struct m0_fid          *current_proc_fid = &reqh->rh_fid;
-	struct m0_fid          *evented_proc_fid = &process_obj->co_id;
-	enum m0_ha_obj_state    evented_proc_state = process_obj->co_ha_state;
-
-	M0_ENTRY();
-	M0_PRE(m0_conf_obj_type(process_obj) == &M0_CONF_PROCESS_TYPE);
-	M0_PRE(m0_fid_eq(evented_proc_fid, &process->dop_rproc_fid));
-	M0_PRE(!m0_fid_eq(evented_proc_fid, &M0_FID0));
-	M0_PRE(!m0_fid_eq(evented_proc_fid, current_proc_fid));
-
-	if (m0_dtm0_in_ut()) {
-		M0_LOG(M0_DEBUG, "No HA handling in UT.");
-		goto out;
-	}
-
-	/**
-	 * A weird logic to make a workaround for current HA
-	 * implementation: skip processing of all HA messages
-	 * until TRANSIENT is received. TRANSIENT is just a
-	 * trigger for handling HA messages in this case.
-	 */
-	if (evented_proc_state != M0_NC_TRANSIENT &&
-	    !ready_to_process_ha_msgs) {
-		M0_LOG(M0_DEBUG, "Is not ready to process HA messages");
-		goto out;
-	}
-
-	M0_LOG(M0_DEBUG,
-	       " evented_proc_state=%d"
-	       " evented_proc_fid="FID_F
-	       " dop_rserv_fid="FID_F
-	       " dop_rproc_fid="FID_F
-	       " curr_proc_fid="FID_F,
-	       evented_proc_state,
-	       FID_P(evented_proc_fid),
-	       FID_P(&process->dop_rserv_fid),
-	       FID_P(&process->dop_rproc_fid),
-	       FID_P(current_proc_fid));
-	M0_LOG(M0_DEBUG, "dtm0=%p dop_rep=%s", dtm0, process->dop_rep);
-
-	switch (evented_proc_state) {
-	case M0_NC_ONLINE:
-		process->dop_service_connect_ast = (struct m0_sm_ast){
-			.sa_cb    = &service_connect_ast,
-			.sa_datum = process,
-		};
-		m0_sm_ast_post(m0_locality_here()->lo_grp,
-			       &process->dop_service_connect_ast);
-		break;
-	case M0_NC_TRANSIENT:
-		ready_to_process_ha_msgs = 1;
-		M0_LOG(M0_DEBUG, "TRANSIENT received, now is "
-		       "ready to process HA messages");
-		break;
-	default:
-		M0_LOG(M0_DEBUG, "Ignored received proc state %d",
-		       evented_proc_state);
-		break;
-	}
-out:
-	M0_LEAVE();
-
-	return false;
-}
-
-static void dtm0_process__ha_state_subscribe(struct dtm0_process *process,
-					     struct m0_conf_obj  *obj)
-{
-	M0_ENTRY();
-	m0_clink_init(&process->dop_ha_link, process_clink_cb);
-	m0_clink_add_lock(&obj->co_ha_chan, &process->dop_ha_link);
-	M0_LEAVE();
-}
-
-static void dtm0_process__ha_state_unsubscribe(struct dtm0_process *process)
-{
-	M0_ENTRY();
-	m0_clink_del_lock(&process->dop_ha_link);
-	m0_clink_fini(&process->dop_ha_link);
-	M0_LEAVE();
-}
-
-static bool conf_obj_is_process(const struct m0_conf_obj *obj)
-{
-	return m0_conf_obj_type(obj) == &M0_CONF_PROCESS_TYPE;
-}
-
-static int dtm0_service__ha_subscribe(struct m0_reqh_service *service)
-{
-	struct m0_confc        *confc;
-	struct m0_conf_root    *root;
-	struct m0_conf_diter    it;
-	struct m0_conf_obj     *obj;
-	struct m0_conf_process *process;
-	struct dtm0_process    *dtm0_process;
-	struct m0_dtm0_service *s;
-	struct m0_fid           rproc_fid;
-	struct m0_fid           rserv_fid;
-	struct m0_fid          *current_proc_fid;
-	int                     rc;
-
-	M0_ENTRY();
-
-	M0_PRE(service != NULL);
-
-	confc = m0_reqh2confc(service->rs_reqh);
-	current_proc_fid = &service->rs_reqh->rh_fid;
-	s = container_of(service, struct m0_dtm0_service, dos_generic);
-
-	/** UT workaround */
-	if (!m0_confc_is_inited(confc)) {
-		M0_LOG(M0_WARN, "confc is not initiated!");
-		return M0_RC(0);
-	}
-
-	rc = m0_confc_root_open(confc, &root);
-	if (rc != 0)
-		return M0_ERR(rc);
-
-	rc = m0_conf_diter_init(&it, confc,
-				&root->rt_obj,
-				M0_CONF_ROOT_NODES_FID,
-				M0_CONF_NODE_PROCESSES_FID);
-	if (rc != 0) {
-		m0_confc_close(&root->rt_obj);
-		return M0_ERR(rc);
-	}
-
-	while ((rc = m0_conf_diter_next_sync(&it, conf_obj_is_process)) > 0) {
-		obj = m0_conf_diter_result(&it);
-		process = M0_CONF_CAST(obj, m0_conf_process);
-		rproc_fid = process->pc_obj.co_id;
-		rc = m0_conf_process2service_get(confc, &rproc_fid,
-						 M0_CST_DTM0, &rserv_fid);
-		if (rc == 0) {
-			if (m0_fid_eq(&rproc_fid, current_proc_fid))
-				/* skip current process */
-				continue;
-			M0_ALLOC_PTR(dtm0_process);
-			M0_ASSERT(dtm0_process != NULL); /* XXX */
-			dtm0_process__ha_state_subscribe(dtm0_process, obj);
-			dopr_tlink_init(dtm0_process);
-			dopr_tlist_add(&s->dos_processes, dtm0_process);
-			dtm0_process->dop_rproc_fid = rproc_fid;
-			dtm0_process->dop_rserv_fid = rserv_fid;
-			dtm0_process->dop_rep =
-				m0_strdup(process->pc_endpoint);
-			dtm0_process->dop_dtm0_service = service;
-		}
-	}
-
-	m0_conf_diter_fini(&it);
-	m0_confc_close(&root->rt_obj);
-
-	return M0_RC(0);
-}
-
-static void dtm0_service__ha_unsubscribe(struct m0_reqh_service *reqh_service)
-{
-	struct dtm0_process    *process;
-	struct m0_dtm0_service *service;
-	int                     rc;
-
-	M0_PRE(reqh_service != NULL);
-	service = container_of(reqh_service, struct m0_dtm0_service,
-			       dos_generic);
-
-	M0_ENTRY("dtms=%p", service);
-
-	while ((process = dopr_tlist_pop(&service->dos_processes)) != NULL) {
-		rc = dtm0_process_disconnect(process);
-		M0_ASSERT_INFO(rc == 0, "TODO: Disconnect failures"
-			       " are not handled yet.");
-		dtm0_process__ha_state_unsubscribe(process);
-		dopr_tlink_fini(process);
-		m0_free(process);
-	}
-
-	M0_LEAVE();
-}
-
 #if !defined(__KERNEL__)
 /* DTM0 RPC Link is a lazy ("on-demand") RPC link. */
 struct drlink_fom {
@@ -693,6 +475,7 @@ struct drlink_fom {
 	struct m0_fid            df_tgt;
 	struct m0_fop           *df_rfop;
 	struct m0_dtm0_service  *df_svc;
+	bool                     df_wait_for_reply;
 };
 
 static struct drlink_fom *fom2drlink_fom(struct m0_fom *fom)
@@ -712,6 +495,7 @@ static void drlink_fom_fini(struct m0_fom *fom)
 {
 	struct drlink_fom *df = fom2drlink_fom(fom);
 	m0_fop_put_lock(df->df_rfop);
+	m0_fom_fini(fom);
 }
 
 static int  drlink_fom_tick(struct m0_fom *fom);
@@ -811,6 +595,7 @@ static int drlink_fom_init(struct drlink_fom            *fom,
 	fom->df_rfop =  fop;
 	fom->df_svc  =  svc;
 	fom->df_tgt  = *tgt;
+	fom->df_wait_for_reply = false;
 
 	m0_co_context_init(&fom->df_co);
 
@@ -827,7 +612,7 @@ static void co_long_write_lock(struct m0_co_context *context,
 {
 	M0_CO_REENTER(context);
 	if (!m0_long_write_lock(lk, link, next_phase))
-		M0_CO_YIELD(context, -EINTR);
+		M0_CO_YIELD_WITH(context, M0_FSO_WAIT);
 }
 
 enum {
@@ -851,7 +636,7 @@ static void co_rpc_link_connect(struct m0_co_context *context,
 	m0_rpc_link_connect_async(rlink, deadline, NULL);
 	m0_fom_phase_set(fom, next_phase);
 
-	M0_CO_YIELD(context, -EINTR);
+	M0_CO_YIELD_WITH(context, M0_FSO_WAIT);
 }
 
 static int dtm0_process_init(struct dtm0_process    *proc,
@@ -897,6 +682,31 @@ static int dtm0_process_init(struct dtm0_process    *proc,
 
 	return M0_RC(0);
 }
+
+static void dtm0_process_fini(struct dtm0_process *proc)
+{
+	dopr_tlink_fini(proc);
+	m0_long_lock_fini(&proc->dop_llock);
+}
+
+static void dtm0_service_conns_term(struct m0_dtm0_service *service)
+{
+	struct dtm0_process    *process;
+	int                     rc;
+
+	M0_ENTRY("dtms=%p", service);
+
+	while ((process = dopr_tlist_pop(&service->dos_processes)) != NULL) {
+		rc = dtm0_process_disconnect(process);
+		M0_ASSERT_INFO(rc == 0, "TODO: Disconnect failures"
+			       " are not handled yet.");
+		dtm0_process_fini(process);
+		m0_free(process);
+	}
+
+	M0_LEAVE();
+}
+
 
 static int find_or_add(struct m0_dtm0_service *dtms,
 		       const struct m0_fid    *tgt,
@@ -946,17 +756,17 @@ static struct m0_sm_state_descr drlink_fom_states[] = {
 	[DRF_INIT] = {
 		.sd_name      = "DRF_INIT",
 		.sd_allowed   = M0_BITS(DRF_INITIALISED, DRF_FAILED),
-		.sd_flags = M0_SDF_INITIAL,
+		.sd_flags     = M0_SDF_INITIAL,
 	},
 	[DRF_DONE] = {
 		.sd_name      = "DRF_DONE",
 		.sd_allowed   = 0,
-		.sd_flags = M0_SDF_TERMINAL,
+		.sd_flags     = M0_SDF_TERMINAL,
 	},
 	[DRF_FAILED] = {
 		.sd_name      = "DRF_FAILED",
-		.sd_allowed   = M0_BITS(DRF_DONE),
-		.sd_flags = M0_SDF_TERMINAL,
+		.sd_allowed   = 0,
+		.sd_flags     = M0_SDF_TERMINAL,
 	},
 
 	/* intermediate states */
@@ -967,11 +777,12 @@ static struct m0_sm_state_descr drlink_fom_states[] = {
 	}
 	_ST(DRF_INITIALISED, M0_BITS(DRF_LOCKING)),
 	_ST(DRF_LOCKING,    M0_BITS(DRF_LOCKED)),
-	_ST(DRF_LOCKED, M0_BITS(DRF_TRYING_TO_CONNECT)),
+	_ST(DRF_LOCKED, M0_BITS(DRF_TRYING_TO_CONNECT, DRF_READY_TO_SEND)),
 	_ST(DRF_TRYING_TO_CONNECT, M0_BITS(DRF_FAILED, DRF_CONNECTING)),
 	_ST(DRF_CONNECTING, M0_BITS(DRF_FAILED, DRF_TRYING_TO_CONNECT,
 				   DRF_READY_TO_SEND)),
-	_ST(DRF_READY_TO_SEND, M0_BITS(DRF_FAILED, DRF_WAITING_FOR_REPLY)),
+	_ST(DRF_READY_TO_SEND, M0_BITS(DRF_FAILED, DRF_WAITING_FOR_REPLY,
+				       DRF_DONE)),
 	_ST(DRF_WAITING_FOR_REPLY, M0_BITS(DRF_FAILED, DRF_DONE)),
 #undef _ST
 };
@@ -982,12 +793,14 @@ static struct m0_sm_trans_descr drlink_fom_trans[] = {
 	{ "lock-wait", DRF_INITIALISED, DRF_LOCKING                       },
 	{ "lock-done", DRF_LOCKING, DRF_LOCKED                            },
 	{ "first-conn-try", DRF_LOCKED, DRF_TRYING_TO_CONNECT             },
+	{ "conn-already", DRF_LOCKED, DRF_READY_TO_SEND                   },
 	{ "conn-wait", DRF_TRYING_TO_CONNECT, DRF_CONNECTING              },
 	{ "conn-init-fail", DRF_TRYING_TO_CONNECT, DRF_FAILED             },
 	{ "conn-fail", DRF_CONNECTING, DRF_FAILED                         },
 	{ "conn-retry", DRF_CONNECTING, DRF_TRYING_TO_CONNECT             },
 	{ "conn-active", DRF_CONNECTING, DRF_READY_TO_SEND                },
 	{ "send-fail", DRF_READY_TO_SEND, DRF_FAILED                      },
+	{ "send-no-wait", DRF_READY_TO_SEND, DRF_DONE                     },
 	{ "reply-wait", DRF_READY_TO_SEND, DRF_WAITING_FOR_REPLY          },
 	{ "reply-fail", DRF_WAITING_FOR_REPLY, DRF_FAILED                 },
 	{ "no-reply-reconn", DRF_WAITING_FOR_REPLY, DRF_TRYING_TO_CONNECT },
@@ -1063,105 +876,94 @@ static int dtm0_process_rlink_send(struct dtm0_process *proc,
 	return m0_rpc_post(item);
 }
 
-static bool dtm0_process_ha_is_alive(struct dtm0_process *proc)
+/** An aggregated status of a dtm0_process:dop_rlink */
+enum dpr_state {
+	/** Link is not alive but we can resurrect it. */
+	DPR_TRANSIENT,
+	/** Link is alive and ready to transfer items. */
+	DPR_ONLINE,
+	/** Link is permanently dead. */
+	DPR_FAILED,
+};
+
+static enum dpr_state dpr_state_infer(struct dtm0_process *proc)
 {
-	(void) proc;
-	/* TODO: check conf_obj state */
-	return true;
+	/* TODO: Observe the states of
+	 *	RPC connection
+	 *	RPC session
+	 *	Conf obj
+	 * and then decide whether it is alive, dead or permanently dead.
+	 */
+
+	if (m0_rpc_link_is_connected(&proc->dop_rlink))
+		return DPR_ONLINE;
+
+	return DPR_TRANSIENT;
 }
 
 #define F M0_CO_FRAME_DATA
 static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
 {
+	int                 rc = 0;
+	struct drlink_fom  *drf = M0_AMB(drf, context, df_co);
+	struct m0_fom      *fom = &drf->df_gen;
+	struct m0_rpc_item *item = &drf->df_rfop->f_item;
+
 	M0_CO_REENTER(context,
 		      struct m0_long_lock_link   llink;
 		      struct m0_long_lock_addb2  llock_addb2;
 		      struct dtm0_process       *proc;
-		      struct drlink_fom         *drf;
-		      struct m0_fom             *fom;
-		      int                        rc;
-		      bool                       delivered;
-		      struct m0_rpc_item        *item;
 		      );
 
-	F(rc) = 0;
-	F(delivered) = false;
-	F(drf) = M0_AMB(F(drf), context, df_co);
-	F(fom) = &F(drf)->df_gen;
-	F(item) = &F(drf)->df_rfop->f_item;
-
-	m0_mutex_lock(&F(drf)->df_svc->dos_generic.rs_mutex);
-	F(rc) = find_or_add(F(drf)->df_svc, &F(drf)->df_tgt, &F(proc));
+	m0_mutex_lock(&drf->df_svc->dos_generic.rs_mutex);
+	rc = find_or_add(drf->df_svc, &drf->df_tgt, &F(proc));
 	/* Safety: assume that processes cannot be evicted */
-	m0_mutex_unlock(&F(drf)->df_svc->dos_generic.rs_mutex);
+	m0_mutex_unlock(&drf->df_svc->dos_generic.rs_mutex);
 
-	if (F(rc) != 0)
+	if (rc != 0)
 		goto out;
 
-	m0_long_lock_link_init(&F(llink), F(fom), &F(llock_addb2));
-	m0_fom_phase_set(F(fom), DRF_INITIALISED);
+	m0_long_lock_link_init(&F(llink), fom, &F(llock_addb2));
+	m0_fom_phase_set(fom, DRF_INITIALISED);
 
 	M0_CO_FUN(context, co_long_write_lock(context,
 					      &F(proc)->dop_llock,
 					      &F(llink),
 					      DRF_LOCKING));
+	m0_fom_phase_set(fom, DRF_LOCKED);
 
-	while (!F(delivered)) {
-		while (!m0_rpc_link_is_connected(&F(proc)->dop_rlink)) {
-			m0_fom_phase_set(F(fom), DRF_TRYING_TO_CONNECT);
-			F(rc) = dtm0_process_rlink_reinit(F(proc), F(drf));
-			if (F(rc) != 0)
-				goto unlock;
-			M0_CO_FUN(context,
-				  co_rpc_link_connect(context,
-						      &F(proc)->dop_rlink,
-						      F(fom), DRF_CONNECTING));
-			if (!dtm0_process_ha_is_alive(F(proc)))
-				goto unlock;
-			if (F(proc)->dop_rlink.rlk_rc != 0) {
-				/* TODO: figure out something better. */
-				(void) M0_ERR(F(proc)->dop_rlink.rlk_rc);
-			}
-		}
-
-		m0_fom_phase_set(F(fom), DRF_READY_TO_SEND);
-		F(rc) = dtm0_process_rlink_send(F(proc), F(drf));
-		if (F(rc) != 0)
+	while (dpr_state_infer(F(proc)) == DPR_TRANSIENT) {
+		m0_fom_phase_set(fom, DRF_TRYING_TO_CONNECT);
+		rc = dtm0_process_rlink_reinit(F(proc), drf);
+		if (rc != 0)
 			goto unlock;
-
-		m0_fom_phase_set(F(fom), DRF_WAITING_FOR_REPLY);
-		M0_CO_YIELD(context, -EINTR);
-
-		F(delivered) = m0_rpc_item_error(F(item)) == 0;
-		/* TODO: Add more showstoppers here (ENOBUFS or something). */
-		if (M0_IN(m0_rpc_item_error(F(item)), (-ENOMEM))) {
-			F(rc) = m0_rpc_item_error(F(item));
-			goto unlock;
-		}
+		M0_CO_FUN(context, co_rpc_link_connect(context,
+						       &F(proc)->dop_rlink,
+						       fom, DRF_CONNECTING));
 	}
 
-	m0_fom_phase_set(F(fom), DRF_DONE);
+	if (dpr_state_infer(F(proc)) == DPR_FAILED)
+	    goto unlock;
+
+	m0_fom_phase_set(fom, DRF_READY_TO_SEND);
+	rc = dtm0_process_rlink_send(F(proc), drf);
+	if (rc != 0)
+		goto unlock;
+
+	if (drf->df_wait_for_reply) {
+		m0_fom_phase_set(fom, DRF_WAITING_FOR_REPLY);
+		M0_CO_YIELD_WITH(context, M0_FSO_WAIT);
+		if (m0_rpc_item_error(item) != 0)
+			goto unlock;
+	}
+
+	m0_fom_phase_set(fom, DRF_DONE);
 
 unlock:
 	m0_long_write_unlock(&F(proc)->dop_llock, &F(llink));
 	m0_long_lock_link_fini(&F(llink));
 out:
-	*prc = F(rc);
-	return;
-}
-
-static int co_ret2fom_ret(int rc)
-{
-	switch (rc) {
-	case 0:
-		return 0;
-	case -EAGAIN:
-		return M0_FSO_AGAIN;
-	case -EINTR:
-		return M0_FSO_WAIT;
-	default:
-		M0_IMPOSSIBLE();
-	}
+	*prc = rc;
 }
 
 static int drlink_fom_tick(struct m0_fom *fom)
@@ -1174,17 +976,21 @@ static int drlink_fom_tick(struct m0_fom *fom)
 
 	M0_CO_START(co);
 	drlink_coro_fom_tick(co, &phase_rc);
-	outcome = co_ret2fom_ret(M0_CO_END(co));
+	outcome = M0_CO_END(co);
 
-	if (outcome == 0 && phase_rc != 0)
-		m0_fom_phase_move(fom, phase_rc, M0_FOPH_FAILURE);
+	if (outcome == 0) {
+		if (phase_rc != 0)
+			m0_fom_phase_move(fom, phase_rc, DRF_FAILED);
+		outcome = M0_FSO_WAIT;
+	}
 
 	return outcome;
 }
 
 M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 				 const struct dtm0_req_fop *req,
-				 const struct m0_fid       *tgt)
+				 const struct m0_fid       *tgt,
+				 bool                       sync)
 {
 	int                  rc;
 	struct drlink_fom   *fom;
@@ -1200,6 +1006,8 @@ M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 		m0_free(fom);
 		return M0_ERR(rc);
 	}
+
+	fom->df_wait_for_reply = sync;
 
 	m0_fom_queue(&fom->df_gen);
 
@@ -1217,9 +1025,10 @@ static void m0_dtm0_rpc_link_mod_fini(void)
 {
 	M0_IMPOSSIBLE();
 }
-M0_INTERNAL int m0_dtm0_post_msg(struct m0_dtm0_service    *svc,
+M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 				 const struct dtm0_req_fop *req,
-				 const struct m0_fid       *tgt)
+				 const struct m0_fid       *tgt,
+				 bool                       sync)
 {
 	(void) svc;
 	(void) req;
@@ -1227,6 +1036,12 @@ M0_INTERNAL int m0_dtm0_post_msg(struct m0_dtm0_service    *svc,
 	M0_IMPOSSIBLE();
 	return 0;
 }
+static void dtm0_service_conns_term(struct m0_dtm0_service *service)
+{
+	(void) service;
+}
+
+
 #endif /* !defined(__KERNEL__) */
 
 
