@@ -58,7 +58,7 @@ static void m0_dtm0_rpc_link_mod_fini(void);
 /* Settings for RPC connections with DTM0 services. */
 enum {
 	DTM0_MAX_RPCS_IN_FLIGHT = 10,
-	DTM0_DISCONNECT_TIMEOUT_SECS = 5
+	DTM0_DISCONNECT_TIMEOUT_SECS = 1,
 };
 
 static const struct m0_reqh_service_type_ops dtm0_service_type_ops = {
@@ -508,10 +508,7 @@ static const struct m0_fom_ops drlink_fom_ops = {
 
 static struct m0_fom_type drlink_fom_type;
 
-static const struct m0_fom_type_ops drlink_fom_type_ops = {
-	.fto_create = NULL
-};
-
+static const struct m0_fom_type_ops drlink_fom_type_ops = {};
 const static struct m0_sm_conf drlink_fom_conf;
 
 static int m0_dtm0_rpc_link_mod_init(void)
@@ -610,30 +607,25 @@ static void co_long_write_lock(struct m0_co_context *context,
 			       struct m0_long_lock_link *link,
 			       int next_phase)
 {
+	int outcome;
 	M0_CO_REENTER(context);
-	if (!m0_long_write_lock(lk, link, next_phase))
-		M0_CO_YIELD_WITH(context, M0_FSO_WAIT);
+	outcome = M0_FOM_LONG_LOCK_RETURN(m0_long_write_lock(lk, link,
+							     next_phase));
+	M0_CO_YIELD_WITH(context, outcome);
 }
-
-enum {
-	/* One second of waiting until we get -ETIMEOUT. */
-	M0_DTM0_RLINK_CONNECT_TIMEOUT = 1,
-};
 
 static void co_rpc_link_connect(struct m0_co_context *context,
 				struct m0_rpc_link *rlink,
 				struct m0_fom *fom,
 				int next_phase)
 {
-	const m0_time_t deadline =
-		m0_time_from_now(M0_DTM0_RLINK_CONNECT_TIMEOUT, 0);
 	M0_CO_REENTER(context);
 
 	m0_chan_lock(&rlink->rlk_wait);
 	m0_fom_wait_on(fom, &rlink->rlk_wait, &fom->fo_cb);
 	m0_chan_unlock(&rlink->rlk_wait);
 
-	m0_rpc_link_connect_async(rlink, deadline, NULL);
+	m0_rpc_link_connect_async(rlink, M0_TIME_NEVER, NULL);
 	m0_fom_phase_set(fom, next_phase);
 
 	M0_CO_YIELD_WITH(context, M0_FSO_WAIT);
@@ -707,7 +699,6 @@ static void dtm0_service_conns_term(struct m0_dtm0_service *service)
 	M0_LEAVE();
 }
 
-
 static int find_or_add(struct m0_dtm0_service *dtms,
 		       const struct m0_fid    *tgt,
 		       struct dtm0_process   **out)
@@ -716,6 +707,7 @@ static int find_or_add(struct m0_dtm0_service *dtms,
 	int                  rc;
 
 	M0_ENTRY();
+	M0_PRE(m0_mutex_is_locked(&dtms->dos_generic.rs_mutex));
 
 	process = dtm0_service_process__lookup(&dtms->dos_generic, tgt);
 	if (process != NULL) {
@@ -775,36 +767,46 @@ static struct m0_sm_state_descr drlink_fom_states[] = {
 		.sd_name    = #name,  \
 		.sd_allowed = allowed \
 	}
-	_ST(DRF_INITIALISED, M0_BITS(DRF_LOCKING)),
-	_ST(DRF_LOCKING,    M0_BITS(DRF_LOCKED)),
-	_ST(DRF_LOCKED, M0_BITS(DRF_TRYING_TO_CONNECT, DRF_READY_TO_SEND)),
+	_ST(DRF_INITIALISED,       M0_BITS(DRF_LOCKING)),
+	_ST(DRF_LOCKING,           M0_BITS(DRF_LOCKED)),
+	_ST(DRF_LOCKED,            M0_BITS(DRF_TRYING_TO_CONNECT,
+					   DRF_READY_TO_SEND)),
 	_ST(DRF_TRYING_TO_CONNECT, M0_BITS(DRF_FAILED, DRF_CONNECTING)),
-	_ST(DRF_CONNECTING, M0_BITS(DRF_FAILED, DRF_TRYING_TO_CONNECT,
-				   DRF_READY_TO_SEND)),
-	_ST(DRF_READY_TO_SEND, M0_BITS(DRF_FAILED, DRF_WAITING_FOR_REPLY,
-				       DRF_DONE)),
+	_ST(DRF_CONNECTING,        M0_BITS(DRF_FAILED, DRF_TRYING_TO_CONNECT,
+					   DRF_READY_TO_SEND)),
+	_ST(DRF_READY_TO_SEND,     M0_BITS(DRF_FAILED, DRF_WAITING_FOR_REPLY,
+					   DRF_DONE)),
 	_ST(DRF_WAITING_FOR_REPLY, M0_BITS(DRF_FAILED, DRF_DONE)),
 #undef _ST
 };
 
 static struct m0_sm_trans_descr drlink_fom_trans[] = {
-	{ "init-done", M0_FOPH_INIT, DRF_INITIALISED                      },
-	{ "init-fail", M0_FOPH_INIT, DRF_FAILED                           },
-	{ "lock-wait", DRF_INITIALISED, DRF_LOCKING                       },
-	{ "lock-done", DRF_LOCKING, DRF_LOCKED                            },
-	{ "first-conn-try", DRF_LOCKED, DRF_TRYING_TO_CONNECT             },
-	{ "conn-already", DRF_LOCKED, DRF_READY_TO_SEND                   },
-	{ "conn-wait", DRF_TRYING_TO_CONNECT, DRF_CONNECTING              },
-	{ "conn-init-fail", DRF_TRYING_TO_CONNECT, DRF_FAILED             },
-	{ "conn-fail", DRF_CONNECTING, DRF_FAILED                         },
-	{ "conn-retry", DRF_CONNECTING, DRF_TRYING_TO_CONNECT             },
-	{ "conn-active", DRF_CONNECTING, DRF_READY_TO_SEND                },
-	{ "send-fail", DRF_READY_TO_SEND, DRF_FAILED                      },
-	{ "send-no-wait", DRF_READY_TO_SEND, DRF_DONE                     },
-	{ "reply-wait", DRF_READY_TO_SEND, DRF_WAITING_FOR_REPLY          },
-	{ "reply-fail", DRF_WAITING_FOR_REPLY, DRF_FAILED                 },
+	{ "init-done",       M0_FOPH_INIT,          DRF_INITIALISED       },
+	{ "init-fail",       M0_FOPH_INIT,          DRF_FAILED            },
+	{ "lock-wait",       DRF_INITIALISED,       DRF_LOCKING           },
+	{ "lock-done",       DRF_LOCKING,           DRF_LOCKED            },
+	{ "first-conn-try",  DRF_LOCKED,            DRF_TRYING_TO_CONNECT },
+	{ "conn-already",    DRF_LOCKED,            DRF_READY_TO_SEND     },
+	{ "conn-wait",       DRF_TRYING_TO_CONNECT, DRF_CONNECTING        },
+	{ "conn-init-fail",  DRF_TRYING_TO_CONNECT, DRF_FAILED            },
+	{ "conn-fail",       DRF_CONNECTING,        DRF_FAILED            },
+#if 0
+	/* FIXME: Reconnects are supposed to be supported on the RPC level. */
+	{ "conn-retry",      DRF_CONNECTING,        DRF_TRYING_TO_CONNECT },
+#endif
+	{ "conn-active",     DRF_CONNECTING,        DRF_READY_TO_SEND     },
+	{ "send-fail",       DRF_READY_TO_SEND,     DRF_FAILED            },
+	{ "send-no-wait",    DRF_READY_TO_SEND,     DRF_DONE              },
+	{ "reply-wait",      DRF_READY_TO_SEND,     DRF_WAITING_FOR_REPLY },
+	{ "reply-fail",      DRF_WAITING_FOR_REPLY, DRF_FAILED            },
+#if 0
+	/*
+	 * FIXME: Reconnects caused by the lack of reply should not be
+	 * handled at this moment. But we may reconsider this after testing.
+	 */
 	{ "no-reply-reconn", DRF_WAITING_FOR_REPLY, DRF_TRYING_TO_CONNECT },
-	{ "delivered", DRF_WAITING_FOR_REPLY, DRF_DONE                    }
+#endif
+	{ "delivered",       DRF_WAITING_FOR_REPLY, DRF_DONE              }
 };
 
 const static struct m0_sm_conf drlink_fom_conf = {
@@ -813,11 +815,6 @@ const static struct m0_sm_conf drlink_fom_conf = {
 	.scf_state     = drlink_fom_states,
 	.scf_trans_nr  = ARRAY_SIZE(drlink_fom_trans),
 	.scf_trans     = drlink_fom_trans
-};
-
-static void dtm0_rlink_rpc_item_reply_cb(struct m0_rpc_item *item);
-const struct m0_rpc_item_ops dtm0_req_fop_rlink_rpc_item_ops = {
-        .rio_replied = dtm0_rlink_rpc_item_reply_cb,
 };
 
 static struct drlink_fom *item2drlink_fom(struct m0_rpc_item *item)
@@ -841,10 +838,15 @@ static void dtm0_rlink_rpc_item_reply_cb(struct m0_rpc_item *item)
 		M0_ASSERT(M0_IN(m0_fop_opcode(reply), (M0_DTM0_REP_OPCODE)));
 	}
 
-	m0_fom_wakeup(&df->df_gen);
+	if (df->df_wait_for_reply)
+		m0_fom_wakeup(&df->df_gen);
 
 	M0_LEAVE("reply=%p", reply);
 }
+
+const struct m0_rpc_item_ops dtm0_req_fop_rlink_rpc_item_ops = {
+        .rio_replied = dtm0_rlink_rpc_item_reply_cb,
+};
 
 static int dtm0_process_rlink_reinit(struct dtm0_process *proc,
 				     struct drlink_fom   *df)
@@ -868,7 +870,7 @@ static int dtm0_process_rlink_send(struct dtm0_process *proc,
 	struct m0_rpc_session  *session = &proc->dop_rlink.rlk_sess;
 	struct m0_rpc_item     *item = &fop->f_item;
 
-	item->ri_ops      = &dtm0_req_fop_rpc_item_ops;
+	item->ri_ops      = &dtm0_req_fop_rlink_rpc_item_ops;
 	item->ri_session  = session;
 	item->ri_prio     = M0_RPC_ITEM_PRIO_MID;
 	item->ri_deadline = M0_TIME_IMMEDIATELY;
@@ -893,8 +895,17 @@ static enum dpr_state dpr_state_infer(struct dtm0_process *proc)
 	 *	RPC session
 	 *	Conf obj
 	 * and then decide whether it is alive, dead or permanently dead.
+	 *
+	 * @verbatim
+	 *	if (conf_obj is ONLINE) {
+	 *		if (conn is ACTIVE && session is in (IDLE, BUSY))
+	 *			return ONLINE;
+	 *		else
+	 *			return TRANSIENT;
+	 *	} else
+	 *		return FAILED;
+	 * @endverbatim
 	 */
-
 	if (m0_rpc_link_is_connected(&proc->dop_rlink))
 		return DPR_ONLINE;
 
@@ -902,11 +913,11 @@ static enum dpr_state dpr_state_infer(struct dtm0_process *proc)
 }
 
 #define F M0_CO_FRAME_DATA
-static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
+static void drlink_coro_fom_tick(struct m0_co_context *context)
 {
-	int                 rc = 0;
-	struct drlink_fom  *drf = M0_AMB(drf, context, df_co);
-	struct m0_fom      *fom = &drf->df_gen;
+	int                 rc   = 0;
+	struct drlink_fom  *drf  = M0_AMB(drf, context, df_co);
+	struct m0_fom      *fom  = &drf->df_gen;
 	struct m0_rpc_item *item = &drf->df_rfop->f_item;
 
 	M0_CO_REENTER(context,
@@ -917,7 +928,7 @@ static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
 
 	m0_mutex_lock(&drf->df_svc->dos_generic.rs_mutex);
 	rc = find_or_add(drf->df_svc, &drf->df_tgt, &F(proc));
-	/* Safety: assume that processes cannot be evicted */
+	/* Safety: assume that processes cannot be evicted. */
 	m0_mutex_unlock(&drf->df_svc->dos_generic.rs_mutex);
 
 	if (rc != 0)
@@ -930,9 +941,10 @@ static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
 					      &F(proc)->dop_llock,
 					      &F(llink),
 					      DRF_LOCKING));
+	M0_ASSERT(m0_long_is_write_locked(&F(proc)->dop_llock, fom));
 	m0_fom_phase_set(fom, DRF_LOCKED);
 
-	while (dpr_state_infer(F(proc)) == DPR_TRANSIENT) {
+	if (dpr_state_infer(F(proc)) == DPR_TRANSIENT) {
 		m0_fom_phase_set(fom, DRF_TRYING_TO_CONNECT);
 		rc = dtm0_process_rlink_reinit(F(proc), drf);
 		if (rc != 0)
@@ -943,7 +955,7 @@ static void drlink_coro_fom_tick(struct m0_co_context *context, int *prc)
 	}
 
 	if (dpr_state_infer(F(proc)) == DPR_FAILED)
-	    goto unlock;
+		goto unlock;
 
 	m0_fom_phase_set(fom, DRF_READY_TO_SEND);
 	rc = dtm0_process_rlink_send(F(proc), drf);
@@ -963,28 +975,19 @@ unlock:
 	m0_long_write_unlock(&F(proc)->dop_llock, &F(llink));
 	m0_long_lock_link_fini(&F(llink));
 out:
-	*prc = rc;
+	if (rc != 0)
+		m0_fom_phase_move(fom, rc, DRF_FAILED);
 }
 
 static int drlink_fom_tick(struct m0_fom *fom)
 {
 	struct m0_co_context *co;
-	int                   phase_rc;
-	int                   outcome;
 
 	co = &fom2drlink_fom(fom)->df_co;
 
 	M0_CO_START(co);
-	drlink_coro_fom_tick(co, &phase_rc);
-	outcome = M0_CO_END(co);
-
-	if (outcome == 0) {
-		if (phase_rc != 0)
-			m0_fom_phase_move(fom, phase_rc, DRF_FAILED);
-		outcome = M0_FSO_WAIT;
-	}
-
-	return outcome;
+	drlink_coro_fom_tick(co);
+	return M0_CO_END(co) ?: M0_FSO_WAIT;
 }
 
 M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
@@ -1007,7 +1010,7 @@ M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 		return M0_ERR(rc);
 	}
 
-	fom->df_wait_for_reply = sync;
+	fom->df_wait_for_reply = true;
 
 	m0_fom_queue(&fom->df_gen);
 
@@ -1025,6 +1028,7 @@ static void m0_dtm0_rpc_link_mod_fini(void)
 {
 	M0_IMPOSSIBLE();
 }
+
 M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 				 const struct dtm0_req_fop *req,
 				 const struct m0_fid       *tgt,
@@ -1036,6 +1040,7 @@ M0_INTERNAL int m0_dtm0_req_post(struct m0_dtm0_service    *svc,
 	M0_IMPOSSIBLE();
 	return 0;
 }
+
 static void dtm0_service_conns_term(struct m0_dtm0_service *service)
 {
 	(void) service;
