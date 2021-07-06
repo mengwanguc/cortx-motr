@@ -120,6 +120,16 @@ type iov struct {
     wg      sync.WaitGroup
 }
 
+type Config struct {
+    LocalEP    string
+    HaxEP      string
+    Profile    string
+    ProcFid    string
+    TraceOn    bool
+    Verbose    bool
+    ThreadsN   int
+}
+
 func checkArg(arg *string, name string) {
     if *arg == "" {
         fmt.Printf("%s: %s must be specified\n\n", os.Args[0], name)
@@ -177,6 +187,46 @@ func Init() {
         log.Panicf("C.m0_container_init() failed: %v", rc)
     }
 }
+
+
+
+// Get parameters from Config, instead of command-line flags
+func InitWithConfig(conf Config) {
+//    checkArg(conf.localEP, "my endpoint (-ep)")
+//    checkArg(conf.haxEP,   "hax endpoint (-hax)")
+//    checkArg(conf.profile, "profile fid (-prof)")
+//    checkArg(conf.procFid, "my process fid (-proc)")
+
+    verbose = conf.Verbose
+    threadsN = conf.ThreadsN
+
+    if !conf.TraceOn {
+        C.m0_trace_set_mmapped_buffer(false)
+    }
+
+    C.conf.mc_is_oostore     = true
+    C.conf.mc_local_addr     = C.CString(conf.LocalEP)
+    C.conf.mc_ha_addr        = C.CString(conf.HaxEP)
+    C.conf.mc_profile        = C.CString(conf.Profile)
+    C.conf.mc_process_fid    = C.CString(conf.ProcFid)
+    C.conf.mc_tm_recv_queue_min_len =    64
+    C.conf.mc_max_rpc_msg_size      = 65536
+    C.conf.mc_idx_service_id  = C.M0_IDX_DIX;
+    C.dix_conf.kc_create_meta = false;
+    C.conf.mc_idx_service_conf = unsafe.Pointer(&C.dix_conf)
+
+    rc := C.m0_client_init(&C.instance, &C.conf, true)
+    if rc != 0 {
+        log.Panicf("m0_client_init() failed: %v", rc)
+    }
+
+    C.m0_container_init(&C.container, nil, &C.M0_UBER_REALM, C.instance)
+    rc = C.container.co_realm.re_entity.en_sm.sm_rc
+    if rc != 0 {
+        log.Panicf("C.m0_container_init() failed: %v", rc)
+    }
+}
+
 
 // ScanID scans object id from string.
 func ScanID(s string) (fid C.struct_m0_uint128, err error) {
