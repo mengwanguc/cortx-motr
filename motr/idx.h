@@ -142,6 +142,7 @@ struct m0_idx_service_ops {
 	int (*iso_fini) (void *svc);
 };
 
+
 /**
  * Client separates the definitions of index service and its instances(ctx)
  * to allow a Client instance to have its own kind of index service.
