@@ -175,6 +175,72 @@ func (mkv *Mkv) doIdxOp(opcode uint32, key []byte, value []byte,
     return value, nil
 }
 
+
+// For NEXT operation. Different from other operations because
+// for NEXT we need to know the returned keys
+func (mkv *Mkv) doIdxOpNext(opcode uint32, key []byte, value []byte,
+                        update bool) ([]byte, []byte, error) {
+    if mkv.idx == nil {
+        return nil, nil, errors.New("index is not opened")
+    }
+
+    var k, v C.struct_m0_bufvec
+    if C.m0_bufvec_empty_alloc(&k, 1) != 0 {
+        return nil, nil, errors.New("failed to allocate key bufvec")
+    }
+    defer C.m0_bufvec_free2(&k)
+
+    {
+        if C.m0_bufvec_empty_alloc(&v, 1) != 0 {
+            return nil, nil, errors.New("failed to allocate value bufvec")
+        }
+        if opcode == C.M0_IC_GET {
+            defer C.m0_bufvec_free(&v) // cleanup buffer after GET
+        } else {
+            defer C.m0_bufvec_free2(&v)
+        }
+    }
+
+    *k.ov_buf = unsafe.Pointer(&key[0])
+    *k.ov_vec.v_count = C.ulong(len(key))
+
+    vPtr := &v
+
+    flags := C.uint(0)
+
+    var rcI C.int32_t
+    var op *C.struct_m0_op
+    rc := C.m0_idx_op(mkv.idx, opcode, &k, vPtr, &rcI, flags, &op)
+    if rc != 0 {
+        return nil, nil, fmt.Errorf("failed to init index op: %d", rc)
+    }
+
+    C.m0_op_launch(&op, 1)
+    rc = C.m0_op_wait(op, bits(C.M0_OS_FAILED,
+                               C.M0_OS_STABLE), C.M0_TIME_NEVER)
+    if rc == 0 {
+        rc = C.m0_rc(op)
+    }
+    C.m0_op_fini(op)
+    C.m0_op_free(op)
+
+    if rc != 0 {
+        return nil, nil, fmt.Errorf("op failed: %d", rc)
+    }
+    if rcI != 0 {
+        return nil, nil, fmt.Errorf("index op failed: %d", rcI)
+    }
+
+    {
+        value = make([]byte, *v.ov_vec.v_count)
+        copy(value, pointer2slice(*v.ov_buf, int(*v.ov_vec.v_count)))
+        key = make([]byte, *k.ov_vec.v_count)
+        copy(key, pointer2slice(*k.ov_buf, int(*k.ov_vec.v_count)))
+    }
+
+    return key, value, nil
+}
+
 // Put puts key-value into the index.
 func (mkv *Mkv) Put(key []byte, value []byte, update bool) error {
     _, err := mkv.doIdxOp(C.M0_IC_PUT, key, value, update)
@@ -192,5 +258,13 @@ func (mkv *Mkv) Delete(key []byte) error {
     _, err := mkv.doIdxOp(C.M0_IC_DEL, key, nil, false)
     return err
 }
+
+
+// Next retrieves value starting from the start key (including)
+func (mkv *Mkv) Next(key []byte) ([]byte, []byte, error) {
+    k, val, err := mkv.doIdxOpNext(C.M0_IC_NEXT, key, nil, false)
+    return k, val, err
+}
+
 
 // vi: sw=4 ts=4 expandtab ai
