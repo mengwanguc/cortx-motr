@@ -1814,12 +1814,26 @@ int m0_client_layout_capture(struct m0_client_layout *layout,
 		      struct m0_obj *obj,
 		      struct m0_client_layout **out);
 
+
+struct read_result {
+        char* data;
+        size_t len;
+        int rc;
+};
+
+int m0_init_instance(void);
+struct read_result* m0_object_read(uint64_t start, uint64_t len);
+
+
 /* Allocate/free in-memory layout data struct for an object. */
 struct m0_client_layout*
 m0_client_layout_alloc(enum m0_client_layout_type type);
 void m0_client_layout_free(struct m0_client_layout *layout);
 
 //** @} end of client group */
+
+
+
 
 #include "motr/idx.h" /* export m0_idx operations and services to client. */
 #include "cas/cas.h"
