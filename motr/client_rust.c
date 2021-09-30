@@ -10,10 +10,11 @@ static struct m0_config motr_conf;
 static struct m0_client *m0_instance = NULL;
 static int instance_init_done = 0;
 
-struct m0_uint128		obj_id = { 12345, 9999999999 };
+// struct m0_uint128		obj_id = { 12345, 9999999999 };
 
 
-int m0_init_instance(void) {
+int m0_init_instance(const char* ha_addr, const char* local_addr, 
+		const char* profile_fid, const char* process_fid) {
         int rc;
 	if (instance_init_done == 1) {
 		M0_LOG(M0_ALWAYS,
@@ -25,10 +26,12 @@ int m0_init_instance(void) {
 		return 0;
 	}
 
-        char* ha_addr = "172.31.12.177@tcp:12345:34:1";
-        char* local_addr = "172.31.12.177@tcp:12345:33:1000";
-        char* profile_fid = "0x7000000000000001:0";
-        char* process_fid = "0x7200000000000001:64";
+	M0_LOG(M0_ALWAYS,
+			"Init instance. HA addr: %s, local addr:%s, profile fid: %s, process fid: %s:\n",
+			ha_addr,
+			local_addr,
+			profile_fid,
+			process_fid);
 
         motr_dix_conf.kc_create_meta = false;
         motr_conf.mc_is_oostore            = true;
@@ -163,6 +166,36 @@ static void prepare_ext_vecs(struct m0_indexvec *ext,
 	}
 }
 
+
+static void prepare_ext_vecs_write(struct m0_indexvec *ext,
+			     struct m0_bufvec   *data,
+			     struct m0_bufvec   *attr,
+			     uint32_t            block_count,
+			     uint64_t            block_size,
+			     uint64_t           *last_index,
+			     char*                s)
+{
+	int      i;
+	int idx = 0;
+
+	M0_LOG(M0_ALWAYS,"block_count: %d, block_size: %d, last: %d",
+			(int)block_count, (int)block_size, (int)*last_index);
+
+	for (i = 0; i < block_count; ++i) {
+		ext->iv_index[i]       = *last_index;
+		ext->iv_vec.v_count[i] = block_size;
+		*last_index           += block_size;
+
+		/* Fill the buffer with all `c`. */
+		M0_LOG(M0_ALWAYS,"start do do memset for block %d", i);
+		memcpy(data->ov_buf[i], &s[idx], data->ov_vec.v_count[i]);
+		idx += block_size;
+		/* we don't want any attributes */
+		attr->ov_vec.v_count[i] = 0;
+	}
+}
+
+
 static void cleanup_vecs(struct m0_indexvec *ext,
 			 struct m0_bufvec   *data,
 			 struct m0_bufvec   *attr)
@@ -180,8 +213,8 @@ static void print_object_data(struct m0_bufvec *data)
 
 	for (i = 0; i < data->ov_vec.v_nr; ++i) {
 		M0_LOG(M0_ALWAYS,"Block %6d:  len:%d\n", i, (int)data->ov_vec.v_count[i]);
-//		M0_LOG(M0_ALWAYS,"%.*s", (int)data->ov_vec.v_count[i],
-//			       (char *)data->ov_buf[i]);
+		M0_LOG(M0_ALWAYS,"%.*s", (int)data->ov_vec.v_count[i],
+			       (char *)data->ov_buf[i]);
 		M0_LOG(M0_ALWAYS,"\n");
 	}
 }
@@ -235,9 +268,10 @@ static void copy_object_data(struct read_result* rres, struct m0_bufvec *data,
 }
 
 
-struct read_result * m0_object_read(uint64_t start, uint64_t len) {
+struct read_result * m0_object_read(uint64_t obj_hi, uint64_t obj_low, uint64_t start, uint64_t len) {
 	int rc = 0;
 	struct read_result *rres = malloc(sizeof(struct read_result));
+	struct m0_uint128 read_obj_id = { obj_hi, obj_low };
 
 	rres->data = NULL;
 	rres->len = 0;
@@ -264,9 +298,9 @@ struct read_result * m0_object_read(uint64_t start, uint64_t len) {
 	struct m0_obj      obj;
 	struct m0_client  *instance;
 
-        struct m0_indexvec ext;
-        struct m0_bufvec   data;
-        struct m0_bufvec   attr;
+	struct m0_indexvec ext;
+	struct m0_bufvec   data;
+	struct m0_bufvec   attr;
 
 	uint64_t	block_size = 4096;
 	uint64_t	block_start = start / block_size;
@@ -283,7 +317,7 @@ struct read_result * m0_object_read(uint64_t start, uint64_t len) {
 
 	M0_SET0(&obj);
 	instance = container->co_realm.re_instance;
-	m0_obj_init(&obj, &container->co_realm, &obj_id,
+	m0_obj_init(&obj, &container->co_realm, &read_obj_id,
 		    m0_client_layout_id(instance));
 
 	M0_LOG(M0_ALWAYS, "---- menglog: done m0_obj_init\n");
@@ -321,7 +355,7 @@ struct read_result * m0_object_read(uint64_t start, uint64_t len) {
 
 	if (rc == 0) {
 		print_object_data(&data);
-		print_object_data(&attr);
+		// print_object_data(&attr);
 		copy_object_data(rres, &data, start, len, block_size);
 	}
 	M0_LOG(M0_ALWAYS, "start: %d  end: %d  len: %d\n", (int)start, (int)end, (int)len);
@@ -332,7 +366,9 @@ out:
 	m0_entity_fini(&obj.ob_entity);
 
 	M0_LOG(M0_ALWAYS, "Object read: %d\n", rc);
-	M0_LOG(M0_ALWAYS, "res len: %d\n", (int)(sizeof(rres->len)));
+	M0_LOG(M0_ALWAYS, "res len: %d\n", (int)((rres->len)));
+	M0_LOG(M0_ALWAYS,"%.*s", (int)(rres->len),
+			       (char *)rres->data);
 	
 	rres->rc = rc;
 	return rres;
@@ -343,6 +379,174 @@ client_out:
 	return rres;
 }
 M0_EXPORTED(m0_object_read);
+
+
+int m0_object_create(uint64_t obj_hi, uint64_t obj_low)
+{
+	if (instance_init_done == 0) {
+		M0_LOG(M0_ERROR,"Error! reading object before initializing instance!\n");
+		return -1;
+	}
+	M0_LOG(M0_ALWAYS,"---- menglog: done m0_client_init\n");
+
+
+	struct m0_container       motr_container;
+	int	rc = 0;
+
+	m0_container_init(&motr_container, NULL, &M0_UBER_REALM, m0_instance);
+	rc = motr_container.co_realm.re_entity.en_sm.sm_rc;
+	if (rc != 0) {
+		M0_LOG(M0_ALWAYS,"error in m0_container_init: %d\n", rc);
+		return rc;
+	}
+	M0_LOG(M0_ALWAYS, "---- menglog: done m0_container_init\n");
+
+
+	struct m0_obj     obj;
+	struct m0_client *instance;
+	struct m0_op     *ops[1] = {NULL};
+
+	struct m0_container *container = &motr_container;
+	struct m0_uint128 create_obj_id = { obj_hi, obj_low };
+	
+
+	M0_SET0(&obj);
+	instance = container->co_realm.re_instance;
+	m0_obj_init(&obj, &container->co_realm, &create_obj_id,
+		    m0_client_layout_id(instance));
+
+	rc = m0_entity_create(NULL, &obj.ob_entity, &ops[0]);
+	if (rc != 0) {
+		printf("Failed to create object: %d\n", rc);
+		return rc;
+	}
+
+	m0_op_launch(ops, 1);
+	rc = m0_op_wait(ops[0],
+			M0_BITS(M0_OS_FAILED, M0_OS_STABLE),
+			M0_TIME_NEVER);
+	if (rc == 0)
+		rc = ops[0]->op_rc;
+
+	m0_op_fini(ops[0]);
+	m0_op_free(ops[0]);
+	ops[0] = NULL;
+
+	m0_entity_fini(&obj.ob_entity);
+
+	printf("Object (id=%lu) creation result: %d\n",
+	       (unsigned long)create_obj_id.u_lo, rc);
+	return rc;
+}
+M0_EXPORTED(m0_object_create);
+
+
+static int write_data_to_object(struct m0_obj      *obj,
+				struct m0_indexvec *ext,
+				struct m0_bufvec   *data,
+				struct m0_bufvec   *attr)
+{
+	int          rc;
+	struct m0_op *ops[1] = { NULL };
+
+	/* Create the write request */
+	m0_obj_op(obj, M0_OC_WRITE, ext, data, attr, 0, 0, &ops[0]);
+	if (ops[0] == NULL) {
+		printf("Failed to init a write op\n");
+		return -EINVAL;
+	}
+
+	/* Launch the write request*/
+	m0_op_launch(ops, 1);
+
+	/* wait */
+	rc = m0_op_wait(ops[0],
+			M0_BITS(M0_OS_FAILED,
+				M0_OS_STABLE),
+			M0_TIME_NEVER);
+	rc = rc ? : ops[0]->op_sm.sm_rc;
+
+	/* fini and release the ops */
+	m0_op_fini(ops[0]);
+	m0_op_free(ops[0]);
+	printf("Object write result: %d\n", rc);
+	return rc;
+}
+
+int m0_object_write(uint64_t obj_hi, uint64_t obj_low, uint64_t start, uint64_t len, char* d)
+{
+	struct m0_obj      obj;
+	struct m0_client  *instance;
+	int                rc;
+
+	// char d[8192];
+	// int x;
+	// for (x = 0; x < 4096; x++) {
+	// 	d[x] = 'a';
+	// 	d[x+4096] = 'b';
+	// }
+
+	struct m0_uint128 write_obj_id = { obj_hi, obj_low };
+
+	if (instance_init_done == 0) {
+		M0_LOG(M0_ERROR,"Error! reading object before initializing instance!\n");
+		return -1;
+	}
+	M0_LOG(M0_ALWAYS,"---- menglog: done m0_client_init\n");
+
+	struct m0_container       motr_container;
+
+	m0_container_init(&motr_container, NULL, &M0_UBER_REALM, m0_instance);
+	rc = motr_container.co_realm.re_entity.en_sm.sm_rc;
+	if (rc != 0) {
+		M0_LOG(M0_ALWAYS,"error in m0_container_init: %d\n", rc);
+		return rc;
+	}
+	M0_LOG(M0_ALWAYS, "---- menglog: done m0_container_init\n");
+	
+	struct m0_container *container = &motr_container;
+
+    struct m0_indexvec ext;
+	struct m0_bufvec   data;
+    struct m0_bufvec   attr;
+
+	uint64_t	last_offset = start;
+	int block_count = len / 4096;
+
+	M0_SET0(&obj);
+	instance = container->co_realm.re_instance;
+	m0_obj_init(&obj, &container->co_realm, &write_obj_id,
+		    m0_client_layout_id(instance));
+
+	rc = object_open(&obj);
+	if (rc != 0) {
+		printf("Failed to open object: rc=%d\n", rc);
+		return rc;
+	}
+
+	/*
+	 * alloc & prepare ext, data and attr. We will write 4k * 2.
+	 */
+	rc = alloc_vecs(&ext, &data, &attr, block_count, 4096);
+	if (rc != 0) {
+		printf("Failed to alloc ext & data & attr: %d\n", rc);
+		goto out;
+	}
+	// prepare_ext_vecs(&ext, &data, &attr, 2, 4096, &last_offset, 'A');
+	prepare_ext_vecs_write(&ext, &data, &attr, block_count, 4096, &last_offset, d);
+
+	/* Start to write data to object */
+	rc = write_data_to_object(&obj, &ext, &data, &attr);
+	cleanup_vecs(&ext, &data, &attr);
+
+out:
+	/* Similar to close() */
+	m0_entity_fini(&obj.ob_entity);
+
+	printf("Object write: %d\n", rc);
+	return rc;
+}
+M0_EXPORTED(m0_object_write);
 
 
 #undef M0_TRACE_SUBSYSTEM
